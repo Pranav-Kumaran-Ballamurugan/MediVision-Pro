@@ -1,636 +1,538 @@
-#!/usr/bin/env python3
-"""
-HALOS ENCRYPTED MESSENGER PRO - ENHANCED VERSION
-- End-to-end encrypted messaging with double encryption
-- Improved TreeKEM group key management
-- Persistent offline message queue with retries
-- Secure media encryption with metadata protection
-- Cross-device sync with conflict resolution
-- Better error handling and logging
-"""
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Mic, Zap, Terminal, Upload, X, Cpu, Send, Wifi, Sparkles, Volume2 } from 'lucide-react';
 
-import os
-import asyncio
-import aiosqlite
-import base64
-from datetime import datetime, timedelta
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from nio import AsyncClient, MatrixRoom, RoomMessageText, LoginResponse
-import hashlib
-import json
-import logging
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, AsyncGenerator
-import secrets
-import aiofiles
+// --- GEMINI API CONFIGURATION ---
+const apiKey = ""; // API Key injected by environment
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("HALOS")
+// Helper: Convert Base64 PCM to WAV for browser playback
+const pcmToWav = (base64PCM, sampleRate = 24000) => {
+  const binaryString = window.atob(base64PCM);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  // FIX: Corrected the loop condition from 'i = 0 < len' to 'i < len'
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  const wavHeader = new ArrayBuffer(44);
+  const view = new DataView(wavHeader);
+  view.setUint32(0, 1179011410, false); // "RIFF"
+  view.setUint32(4, 36 + len, true);    // file length
+  view.setUint32(8, 1163280727, false); // "WAVE"
+  view.setUint32(12, 544501094, false); // "fmt "
+  view.setUint32(16, 16, true);         // sub-chunk size
+  view.setUint16(20, 1, true);          // format (PCM)
+  view.setUint16(22, 1, true);          // channels
+  view.setUint32(24, sampleRate, true); // sample rate
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true);          // block align
+  view.setUint16(34, 16, true);         // bits per sample
+  view.setUint32(36, 1635017060, false); // "data"
+  view.setUint32(40, len, true);         // data size
+  return new Blob([wavHeader, bytes], { type: 'audio/wav' });
+};
 
-# ======================
-# DATA MODELS
-# ======================
+// --- MAIN APPLICATION LOGIC ---
 
-@dataclass
-class DeviceInfo:
-    device_id: str
-    public_key: bytes
-    last_seen: datetime
+export default function AICompanion() {
+  // State
+  const [active, setActive] = useState(true); // Default to active
+  const [isAudioUnlocked, setIsAudioUnlocked] = useState(false); 
+  const [listening, setListening] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+  const [thinking, setThinking] = useState(false);
+  const [useNetlink, setUseNetlink] = useState(true); 
+  const [showDebug, setShowDebug] = useState(false);
+  
+  // Chat & History
+  const [inputText, setInputText] = useState("");
+  const [conversation, setConversation] = useState([{ sender: 'system', text: "MediVision Core operational. Ready for Diagnostic Input." }]);
+  
+  const [logs, setLogs] = useState([]);
+  const [userFile, setUserFile] = useState(null);
 
-@dataclass
-class PendingMessage:
-    room_id: str
-    content: str
-    timestamp: datetime
-    attempts: int = 0
+  const recognitionRef = useRef(null);
+  const synthRef = useRef(window.speechSynthesis);
+  const audioRef = useRef(new Audio());
+  const audioContextRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const chatEndRef = useRef(null);
 
-# ======================
-# CORE MESSENGER CLASS
-# ======================
+  // --- LOGGING & UTILS ---
+  const addLog = useCallback((source, message) => {
+    const logMessage = String(message);
+    setLogs(prev => [...prev.slice(-9), { source, message: logMessage, time: new Date().toLocaleTimeString() }]);
+  }, []);
 
-class HALOSMessenger:
-    def __init__(self, config_path: str = "halos_config.json"):
-        self.config_path = config_path
-        self.config = self._load_config()
-        
-        # Matrix client setup
-        self.client = AsyncClient(
-            homeserver=self.config.get("homeserver", "https://matrix.org"),
-            user=self.config.get("user_id"),
-            device_id=self.config.get("device_id", "default_device"),
-            store_path=self.config.get("store_path", "halos_store")
-        )
-        
-        # Encryption systems
-        self.identity_key = self._load_or_generate_identity_key()
-        self.room_keys = {}  # {room_id: Fernet(key)}
-        self.key_trees = {}  # {room_id: KeyTree}
-        self.media_keys = {}  # {media_id: (key, hash)}
-        
-        # Device management
-        self.known_devices: Dict[str, DeviceInfo] = {}
-        
-        # Offline and sync systems
-        self.offline_queue = OfflineQueue()
-        self.sync_engine = SyncEngine()
-        self.message_callbacks = []
-        
-        # Session state
-        self.is_online = False
-        self.sync_task = None
+  const addToConversation = (sender, text) => {
+    const conversationText = String(text);
+    setConversation(prev => [...prev, { sender, text: conversationText }]);
+  };
 
-    def _load_config(self) -> Dict:
-        """Load configuration from file or environment variables"""
-        try:
-            if os.path.exists(self.config_path):
-                with open(self.config_path) as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"Failed to load config: {e}")
-        
-        return {
-            "user_id": os.getenv("MATRIX_USER_ID"),
-            "password": os.getenv("MATRIX_PASSWORD"),
-            "device_id": os.getenv("DEVICE_ID") or f"halos_{secrets.token_hex(4)}",
-            "homeserver": os.getenv("MATRIX_HOMESERVER", "https://matrix.org")
-        }
+  useEffect(() => {
+    if (chatEndRef.current) {
+        chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [conversation]);
 
-    def _load_or_generate_identity_key(self) -> x25519.X25519PrivateKey:
-        """Load or generate the device's long-term identity key"""
-        key_file = "identity_key.pem"
-        try:
-            if os.path.exists(key_file):
-                with open(key_file, "rb") as f:
-                    return x25519.X25519PrivateKey.from_private_bytes(f.read())
-        except Exception as e:
-            logger.warning(f"Failed to load identity key: {e}")
-        
-        # Generate new key if none exists
-        new_key = x25519.X25519PrivateKey.generate()
-        with open(key_file, "wb") as f:
-            f.write(new_key.private_bytes_raw())
-        return new_key
+  // --- IMAGE HANDLING ---
+  const handleFileChange = (event) => {
+    const file = event.target.files[0];
+    if (file && file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64Data = reader.result.split(',')[1]; 
+        setUserFile({ base64: base64Data, mimeType: file.type, name: file.name });
+        addToConversation('system', `Image loaded: ${file.name}`);
+        addLog("Data Input", `Scan initialized: ${file.name}`);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
 
-    async def login(self) -> bool:
-        """Authenticate with Matrix server with retry logic"""
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                resp = await self.client.login(
-                    password=self.config["password"],
-                    device_name=f"HALOS/{self.config['device_id']}"
-                )
-                
-                if isinstance(resp, LoginResponse):
-                    self.is_online = True
-                    logger.info(f"Logged in as {self.client.user_id}")
-                    self._start_background_tasks()
-                    return True
-                
-                logger.error(f"Login failed: {resp}")
-                return False
-            except Exception as e:
-                logger.error(f"Login attempt {attempt + 1} failed: {e}")
-                if attempt < max_attempts - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-        
-        return False
+  const clearFile = () => {
+    setUserFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    addToConversation('system', "Image data cleared.");
+  };
 
-    def _start_background_tasks(self):
-        """Start essential background tasks"""
-        self.sync_task = asyncio.create_task(self._sync_forever())
-        self.sync_task.add_done_callback(self._handle_task_failure)
-        
-        # Start periodic tasks
-        asyncio.create_task(self._periodic_key_rotation())
-        asyncio.create_task(self._periodic_offline_flush())
+  // --- AUDIO INIT ---
+  const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAAABkYXRhAAAAAA=="; 
 
-    def _handle_task_failure(self, task: asyncio.Task):
-        """Restart failed background tasks"""
-        try:
-            task.result()  # This will raise the exception if one occurred
-        except Exception as e:
-            logger.error(f"Background task failed: {e}")
-            if task == self.sync_task:
-                logger.info("Restarting sync task...")
-                self._start_background_tasks()
+  const unlockAudio = useCallback(async () => {
+    if (isAudioUnlocked) return true;
+    addLog("System", "Attempting audio output activation...");
+    try {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return false;
+      
+      if (audioContextRef.current === null) {
+        audioContextRef.current = new AudioContext();
+      }
+      
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
 
-# ======================
-# ENHANCED ENCRYPTION LAYERS
-# ======================
+      audioRef.current.src = SILENT_WAV; 
+      audioRef.current.volume = 0; 
+      await audioRef.current.play().catch(e => {});
+      audioRef.current.pause(); 
+      setIsAudioUnlocked(true);
+      addLog("System", "Audio output successful.");
+      return true;
+    } catch (e) {
+      addLog("Error", `Audio unlock failed: ${e.message}`);
+      return false;
+    }
+  }, [isAudioUnlocked, addLog]);
 
-    async def _init_room_encryption(self, room_id: str):
-        """Initialize encryption for a new room with member verification"""
-        if room_id in self.room_keys:
-            return
-            
-        # Verify room members first
-        members = await self._get_verified_room_members(room_id)
-        if not members:
-            raise ValueError("No verified members in room")
-        
-        # Generate Fernet key for message encryption
-        fernet_key = Fernet.generate_key()
-        self.room_keys[room_id] = Fernet(fernet_key)
-        
-        # Initialize TreeKEM with forward secrecy
-        self.key_trees[room_id] = KeyTree(
-            members,
-            initial_chain_secret=secrets.token_bytes(32)
-        
-        # Broadcast initial key package with signatures
-        await self._broadcast_key_package(room_id)
-        logger.info(f"Initialized encryption for room {room_id}")
-
-    async def _broadcast_key_package(self, room_id: str):
-        """Securely distribute encryption keys to verified room members"""
-        key_package = {
-            "version": 1,
-            "fernet_key": base64.b64encode(self.room_keys[room_id]._signing_key).decode(),
-            "root_chain": base64.b64encode(self.key_trees[room_id].root_chain).decode(),
-            "sender": self.client.user_id,
-            "timestamp": datetime.utcnow().isoformat(),
-            "signature": self._sign_data(
-                f"{room_id}{self.room_keys[room_id]._signing_key.hex()}"
-            )
-        }
-        
-        # Encrypt the package for each recipient
-        encrypted_packages = {}
-        for member in self.key_trees[room_id].members:
-            if member != self.client.user_id:
-                encrypted_packages[member] = self._encrypt_for_device(
-                    member,
-                    json.dumps(key_package).encode()
-                )
-        
-        await self.client.room_send(
-            room_id,
-            message_type="halos.key_package",
-            content={
-                "packages": encrypted_packages,
-                "sender_key": base64.b64encode(
-                    self.identity_key.public_key().public_bytes_raw()
-                ).decode()
-            }
-        )
-
-    def _sign_data(self, data: str) -> str:
-        """Sign data with identity key"""
-        signature = self.identity_key.sign(data.encode())
-        return base64.b64encode(signature).decode()
-
-# ======================
-# IMPROVED MESSAGE HANDLING
-# ======================
-
-    async def send_message(self, room_id: str, text: str) -> bool:
-        """Send encrypted message with offline support and delivery tracking"""
-        try:
-            if room_id not in self.room_keys:
-                await self._init_room_encryption(room_id)
-            
-            # Encrypt with Fernet + TreeKEM chain
-            encrypted = self._double_encrypt(room_id, text)
-            message_id = hashlib.sha256(encrypted.encode()).hexdigest()[:12]
-            
-            if await self._is_online():
-                resp = await self.client.room_send(
-                    room_id,
-                    message_type="m.room.message",
-                    content={
-                        "msgtype": "m.text",
-                        "body": encrypted,
-                        "halos": {
-                            "message_id": message_id,
-                            "timestamp": datetime.utcnow().isoformat()
-                        }
-                    }
-                )
-                
-                if hasattr(resp, "event_id"):
-                    await self.sync_engine.update_sent_message(room_id, text, message_id)
-                    logger.info(f"Message sent to {room_id} (ID: {message_id})")
-                    return True
-                else:
-                    logger.warning(f"Failed to send message to {room_id}")
-                    await self.offline_queue.enqueue(room_id, encrypted, message_id)
-                    return False
-            else:
-                await self.offline_queue.enqueue(room_id, encrypted, message_id)
-                logger.info(f"Message queued offline for {room_id} (ID: {message_id})")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}", exc_info=True)
-            return False
-
-    def _double_encrypt(self, room_id: str, text: str) -> str:
-        """Apply both Fernet and TreeKEM encryption with improved key derivation"""
-        # First layer: Fernet
-        fernet_encrypted = self.room_keys[room_id].encrypt(text.encode())
-        
-        # Second layer: TreeKEM with improved key derivation
-        chain_key = self.key_trees[room_id].get_current_chain()
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=os.urandom(16),  # Randomized salt for each encryption
-            info=b'HALOS_TREEKEM_' + chain_key[:4]  # Key-specific context
-        )
-        encryption_key = hkdf.derive(chain_key)
-        
-        cipher = AESGCM(encryption_key)
-        nonce = os.urandom(12)
-        ciphertext = cipher.encrypt(nonce, fernet_encrypted, None)
-        
-        # Package with version info
-        encrypted_package = {
-            "v": 1,  # Version
-            "n": base64.b64encode(nonce).decode(),
-            "c": base64.b64encode(ciphertext).decode(),
-            "k": base64.b64encode(chain_key[:4]).decode()  # Key hint
-        }
-        
-        return json.dumps(encrypted_package)
-
-# ======================
-# ENHANCED MEDIA HANDLING
-# ======================
-
-    async def send_media(self, room_id: str, file_path: str) -> Optional[str]:
-        """Encrypt and send media files with metadata protection"""
-        try:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"File not found: {file_path}")
-                
-            media_id = hashlib.sha256(file_path.encode()).hexdigest()[:16]
-            encryptor = MediaEncryptor()
-            
-            async with aiofiles.open(file_path, 'rb') as f:
-                file_data = await f.read()
-            
-            # Calculate file hash before encryption
-            file_hash = hashlib.sha256(file_data).hexdigest()
-            encrypted_data = encryptor.encrypt_file(file_data)
-            
-            # Store key with hash for verification
-            self.media_keys[media_id] = (encryptor.key, file_hash)
-            
-            # Prepare encrypted metadata
-            metadata = {
-                "name": os.path.basename(file_path),
-                "type": "application/octet-stream",  # TODO: detect actual type
-                "size": len(file_data),
-                "hash": file_hash
-            }
-            encrypted_metadata = self.room_keys[room_id].encrypt(
-                json.dumps(metadata).encode()
-            )
-            
-            if await self._is_online():
-                # Upload both data and metadata
-                upload_resp = await self._upload_media(room_id, media_id, encrypted_data)
-                if upload_resp:
-                    await self.client.room_send(
-                        room_id,
-                        message_type="halos.media",
-                        content={
-                            "id": media_id,
-                            "url": upload_resp.content_uri,
-                            "metadata": base64.b64encode(encrypted_metadata).decode(),
-                            "key_hint": base64.b64encode(encryptor.key[:4]).decode()
-                        }
-                    )
-                    return media_id
-            else:
-                # Queue for offline delivery
-                await self.offline_queue.enqueue(
-                    room_id, 
-                    f"MEDIA:{media_id}:{base64.b64encode(encrypted_data).decode()}:"
-                    f"{base64.b64encode(encrypted_metadata).decode()}"
-                )
-                return media_id
-                
-        except Exception as e:
-            logger.error(f"Failed to send media: {e}", exc_info=True)
-            return None
-
-# ======================
-# IMPROVED OFFLINE SUPPORT
-# ======================
-
-    async def flush_offline_messages(self):
-        """Send all queued messages with retry logic and priority"""
-        async for pending in self.offline_queue.pending_messages():
-            try:
-                if pending.content.startswith("MEDIA:"):
-                    # Handle media messages
-                    parts = pending.content.split(":")
-                    if len(parts) >= 4:
-                        media_id = parts[1]
-                        data = base64.b64decode(parts[2])
-                        metadata = base64.b64decode(parts[3]) if len(parts) > 3 else None
-                        
-                        upload_resp = await self._upload_media(pending.room_id, media_id, data)
-                        if upload_resp:
-                            content = {
-                                "id": media_id,
-                                "url": upload_resp.content_uri
-                            }
-                            if metadata:
-                                content["metadata"] = base64.b64encode(metadata).decode()
-                            
-                            await self.client.room_send(
-                                pending.room_id,
-                                message_type="halos.media",
-                                content=content
-                            )
-                            await self.offline_queue.mark_delivered(pending)
-                else:
-                    # Handle regular messages
-                    resp = await self.client.room_send(
-                        pending.room_id,
-                        message_type="m.room.message",
-                        content={
-                            "msgtype": "m.text",
-                            "body": pending.content
-                        }
-                    )
-                    if hasattr(resp, "event_id"):
-                        await self.offline_queue.mark_delivered(pending)
-                        
-            except Exception as e:
-                logger.warning(f"Failed to send queued message (attempt {pending.attempts + 1}): {e}")
-                await self.offline_queue.record_attempt(pending)
-                
-                # Exponential backoff before retry
-                await asyncio.sleep(min(2 ** pending.attempts, 60))  # Max 1 minute
-
-# ======================
-# ENHANCED SYNC SYSTEM
-# ======================
-
-    async def _sync_forever(self):
-        """Continuous sync with error handling and backoff"""
-        while True:
-            try:
-                await self.client.sync(timeout=30000, full_state=True)
-                self.is_online = True
-                
-                # Process any received messages
-                await self._process_sync_response()
-                
-                # Check for pending messages
-                if self.offline_queue.has_pending():
-                    await self.flush_offline_messages()
-                    
-                await asyncio.sleep(5)  # Normal sync interval
-                
-            except Exception as e:
-                self.is_online = False
-                logger.error(f"Sync error: {e}", exc_info=True)
-                await asyncio.sleep(10)  # Longer wait on error
-
-    async def sync_devices(self):
-        """Enhanced device sync with conflict resolution"""
-        # Get latest messages with timestamps
-        messages = await self._get_recent_messages()
-        
-        # Build Merkle tree with version vectors
-        my_root, my_versions = self.sync_engine.build_tree_with_versions(messages)
-        
-        for device_id, device in self.known_devices.items():
-            if device_id == self.config["device_id"]:
-                continue
-                
-            their_root, their_versions = await self._get_device_state(device_id)
-            
-            if their_root and my_root != their_root:
-                # Resolve conflicts
-                await self._reconcile_differences(
-                    device_id,
-                    my_root,
-                    my_versions,
-                    their_root,
-                    their_versions
-                )
-
-# ======================
-# IMPROVED SUPPORTING CLASSES
-# ======================
-
-class KeyTree:
-    """Enhanced TreeKEM implementation with forward secrecy"""
-    def __init__(self, members: List[str], initial_chain_secret: bytes = None):
-        self.members = members
-        self.private_key = x25519.X25519PrivateKey.generate()
-        self.public_key = self.private_key.public_key()
-        
-        # Chain keys with forward secrecy
-        self.chain_secrets = {
-            member: self._derive_chain_key(
-                initial_chain_secret or secrets.token_bytes(32)
-            )
-            for member in members
-        }
-        
-        # Root chain gets updated with each ratchet
-        self.root_chain = self._derive_root_chain(initial_chain_secret)
-        self.update_timestamp = datetime.utcnow()
-        
-    def _derive_chain_key(self, input_key: bytes) -> bytes:
-        """Improved key derivation with context binding"""
-        return HKDF(
-            algorithm=hashes.SHA512(),  # Stronger hash
-            length=64,  # Longer output
-            salt=os.urandom(16),
-            info=b'HALOS_CHAIN_KEY_' + input_key[:4]
-        ).derive(input_key)[:32]  # Truncate to 256 bits
-
-    def ratchet_chain(self):
-        """Update chain keys for forward secrecy"""
-        new_secret = secrets.token_bytes(32)
-        self.root_chain = self._derive_root_chain(new_secret)
-        for member in self.members:
-            self.chain_secrets[member] = self._derive_chain_key(new_secret)
-        self.update_timestamp = datetime.utcnow()
-
-class OfflineQueue:
-    """Persistent offline message storage with priority and retries"""
-    def __init__(self, db_path: str = 'offline.db'):
-        self.db_path = db_path
-        self._init_db()
-        
-    def _init_db(self):
-        """Initialize database with schema"""
-        async def _async_init():
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS messages (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        room_id TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        message_id TEXT,
-                        timestamp REAL NOT NULL,
-                        attempts INTEGER DEFAULT 0,
-                        last_attempt REAL,
-                        delivered INTEGER DEFAULT 0
-                    )
-                """)
-                await db.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_undelivered 
-                    ON messages(delivered, attempts, timestamp)
-                """)
-                await db.commit()
-                
-        asyncio.run(_async_init())
-        
-    async def enqueue(self, room_id: str, content: str, message_id: str = None):
-        """Add message to queue with tracking"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT INTO messages (room_id, content, message_id, timestamp) VALUES (?, ?, ?, ?)",
-                (room_id, content, message_id, datetime.utcnow().timestamp())
-            )
-            await db.commit()
-            
-    async def pending_messages(self) -> AsyncGenerator[PendingMessage, None]:
-        """Generator for undelivered messages in priority order"""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("""
-                SELECT rowid, room_id, content, timestamp, attempts 
-                FROM messages 
-                WHERE delivered = 0 
-                ORDER BY attempts, timestamp
-            """) as cursor:
-                async for row in cursor:
-                    yield PendingMessage(
-                        room_id=row[1],
-                        content=row[2],
-                        timestamp=datetime.fromtimestamp(row[3]),
-                        attempts=row[4]
-                    )
-
-class MediaEncryptor:
-    """Enhanced media encryption with chunking support"""
-    CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+  const stopSystem = () => {
+    setActive(false);
+    setListening(false);
+    setThinking(false);
+    setSpeaking(false);
+    if (recognitionRef.current) recognitionRef.current.abort();
+    if (synthRef.current) synthRef.current.cancel();
+    audioRef.current.pause();
     
-    def __init__(self):
-        self.key = AESGCM.generate_key(bit_length=256)
-        self.chunk_keys = []  # For chunked encryption
-        
-    def encrypt_file(self, data: bytes) -> bytes:
-        """Encrypt file data with metadata header"""
-        aesgcm = AESGCM(self.key)
-        nonce = os.urandom(12)
-        
-        # Encrypt with metadata about encryption
-        encrypted = nonce + aesgcm.encrypt(
-            nonce,
-            data,
-            b"HALOS_MEDIA_v1"
-        )
-        
-        return encrypted
+    if (audioContextRef.current) {
+       const context = audioContextRef.current;
+       if (context.state !== 'closed') {
+           try { context.close(); addLog("System", "AudioContext closed."); } catch(e) { addLog("Error", `Failed to close AudioContext: ${e.message}`); }
+       }
+       audioContextRef.current = null; 
+    }
 
-class SyncEngine:
-    """Enhanced sync with version vectors and conflict resolution"""
-    def build_tree_with_versions(self, messages: List[Tuple[str, int]]) -> Tuple[str, Dict[str, int]]:
-        """Build Merkle tree with version vectors for conflict detection"""
-        version_vector = {}
-        hashes = []
+    setIsAudioUnlocked(false);
+    addToConversation('system', "System Offline. Session Terminated.");
+    addLog("System", "Offline");
+  };
+
+  const handleMainButtonClick = () => {
+    if (active) stopSystem();
+    else {
+      setActive(true);
+      const activate = async () => {
+        const success = await unlockAudio();
+        if (success) {
+          addToConversation('system', "System Online. Ready for Diagnostic Input.");
+          addLog("System", "Fully Operational.");
+        } else {
+          addToConversation('system', "System Online (Voice Output Disabled). Ready for Diagnostic Input.");
+          addLog("System", "Fully Operational (Audio Failure).");
+        }
+      }
+      activate();
+    }
+  };
+  
+  const startListening = useCallback(() => {
+    if (recognitionRef.current && !listening && !speaking && !thinking && active) {
+      try {
+        recognitionRef.current.start();
+      } catch (e) {
+        addLog("Error", `Recognition start failed: ${e.message}`);
+      }
+    }
+  }, [listening, speaking, thinking, active, addLog]);
+
+
+  // --- INITIALIZATION AND HANDLERS ---
+  useEffect(() => {
+    // --- AUTO-ACTIVATION ON MOUNT ---
+    const activateOnMount = async () => {
+      const success = await unlockAudio();
+      if (!success) {
+        addToConversation('system', "Warning: Voice Output failed to initialize. Using text only.");
+      }
+      setActive(true);
+      addLog("System", "Interface Initialized.");
+    };
+    activateOnMount();
+    
+    // Audio Player setup
+    audioRef.current.volume = 1.0; 
+    audioRef.current.onplay = () => setSpeaking(true);
+    audioRef.current.onended = () => {
+      setSpeaking(false);
+      if (active) setTimeout(() => startListening(), 500);
+    };
+    audioRef.current.onerror = () => { setSpeaking(false); if (active) startListening(); };
+
+    // Speech Recognition setup
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognitionRef.current = new SpeechRecognition();
+      recognitionRef.current.continuous = false;
+      recognitionRef.current.interimResults = false;
+      recognitionRef.current.lang = 'en-US';
+
+      recognitionRef.current.onstart = () => { setListening(true); addLog("Sensors", "Listening"); };
+      recognitionRef.current.onend = () => { setListening(false); };
+      recognitionRef.current.onerror = (event) => { addLog("Sensors", `Recognition error: ${event.error}`); };
+
+      recognitionRef.current.onresult = (event) => {
+        const text = event.results[0][0].transcript;
+        if (text.trim().length > 0) {
+           addToConversation('user', text);
+           addLog("Voice Input", text);
+           recognitionRef.current.abort();
+           processInput(text);
+        }
+      };
+    }
+
+    // Cleanup function
+    return () => {
+      if (recognitionRef.current) recognitionRef.current.abort();
+      if (synthRef.current) synthRef.current.cancel();
+      audioRef.current.pause();
+      
+      if (audioContextRef.current) {
+         const context = audioContextRef.current;
+         if (context.state !== 'closed') {
+             try { context.close(); } catch(e) {} 
+         }
+      }
+    };
+  }, [active, addLog, startListening, unlockAudio]); 
+
+  const speak = (text, audioBlob = null) => {
+    if (useNetlink && audioBlob) {
+      try {
+        const url = URL.createObjectURL(audioBlob);
+        audioRef.current.src = url;
+        audioRef.current.play().catch(() => speakLocalFallback(text));
+        addToConversation('ai', text);
+        return;
+      } catch (e) {
+        speakLocalFallback(text);
+        return;
+      }
+    }
+    speakLocalFallback(text);
+  };
+  
+  const speakLocalFallback = (text) => {
+     if (!synthRef.current) return;
+     synthRef.current.cancel();
+     const utterance = new SpeechSynthesisUtterance(text);
+     const voices = synthRef.current.getVoices();
+     // Use a clear, professional-sounding voice
+     const professionalVoice = voices.find(v => v.name.includes('Google US English') || v.name.includes('Alex') || v.lang === 'en-US');
+     if (professionalVoice) utterance.voice = professionalVoice;
+     utterance.pitch = 1.0; 
+     utterance.rate = 1.05;  
+     utterance.onstart = () => setSpeaking(true);
+     utterance.onend = () => { setSpeaking(false); if (active) setTimeout(() => startListening(), 500); };
+     synthRef.current.speak(utterance);
+     addToConversation('ai', text);
+  }
+
+  // --- TEXT INPUT HANDLER ---
+  const handleTextSubmit = (e) => {
+    e.preventDefault();
+    if (!inputText.trim()) return;
+    
+    if (listening && recognitionRef.current) recognitionRef.current.abort();
+    
+    const text = inputText;
+    setInputText("");
+    addToConversation('user', text);
+    addLog("Text Input", text);
+    processInput(text);
+  };
+
+  // --- AI BRAIN ---
+  const systemInstruction = `
+    You are the MediVision Pro Core AI, a sophisticated diagnostic support system. You assist professional medical personnel (radiologists, physicians) by analyzing data, providing summaries, and responding to technical queries.
+    Your tone must be highly professional, concise, clinical, and precise. Avoid any conversational filler, slang, or emojis.
+    Keep all diagnostic summaries and responses brief (1-2 sentences maximum).
+    If asked about your identity, state: "I am MediVision Pro Core, a multimodal diagnostic support platform."
+    
+    **CONTEXT: MediVision Pro**
+    - **Purpose:** Accelerate and enhance the accuracy of medical diagnosis using deep-learning models.
+    
+    **CRITICAL RULE: IMAGE ANALYSIS**
+    If the user uploads an image, analyze it as a medical scan. Provide a structured finding and state the system's confidence level (e.g., "Finding: Minor calcification detected in the lower right lobe. Confidence Score: 98.7%.").
+    If the image is not medical, state: "Input Error: Non-diagnostic file format detected. Please upload a valid medical scan."
+  `;
+
+  const callGeminiBrain = async (userText) => {
+    setThinking(true);
+    let text = "System Error: Diagnostic core link failure. Data transfer interrupted.";
+    try {
+        const parts = [];
+        if (userFile && userFile.base64) {
+            parts.push({ inlineData: { mimeType: userFile.mimeType, data: userFile.base64 } });
+        }
+        parts.push({ text: userText });
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contents: [{ parts: parts }], systemInstruction: { parts: [{ text: systemInstruction }] } })
+          }
+        );
+        const data = await response.json();
+        text = String(data.candidates?.[0]?.content?.parts?.[0]?.text || text);
+    } catch (e) {
+        text = "Connection failure. Re-attempting handshake...";
+    }
+    setThinking(false);
+    return text;
+  };
+
+  const callGeminiVoice = async (text) => {
+    if (!isAudioUnlocked) return null;
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: text }] }],
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } } 
+            }
+          })
+        }
+      );
+      const data = await response.json();
+      const base64Audio = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) return pcmToWav(base64Audio);
+    } catch (e) {}
+    return null;
+  };
+
+  const processInput = async (text) => {
+    if (useNetlink) {
+      const replyText = await callGeminiBrain(text);
+      const audioBlob = await callGeminiVoice(replyText);
+      speak(replyText, audioBlob);
+      return;
+    }
+    let reply = "Local processing mode. Netlink is required for access to the full diagnostic core.";
+    speakLocalFallback(reply);
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-950 font-sans text-white overflow-hidden flex flex-col relative selection:bg-cyan-500/30">
+      
+      {/* --- HEADER (Navigation & Controls) --- */}
+      <nav className="relative z-50 px-6 py-4 flex justify-between items-center bg-gray-900/90 backdrop-blur-sm border-b border-cyan-800/50 shadow-2xl shadow-black/70">
+        <div className="flex items-center gap-2">
+           <Zap className={`w-5 h-5 ${active ? 'text-red-500' : 'text-gray-600'}`} />
+           <span className="font-extrabold text-xl tracking-widest text-white">MEDI<span className="text-red-500">VISION</span> PRO</span>
+        </div>
+        <div className="flex items-center gap-6">
+           {/* NETLINK TOGGLE */}
+           <div className="flex items-center gap-2 text-xs font-semibold text-gray-400">
+               <Wifi size={14} className={useNetlink ? 'text-cyan-400' : 'text-gray-600'} />
+               NETLINK
+               <button 
+                 onClick={() => setUseNetlink(!useNetlink)}
+                 className={`relative w-10 h-5 rounded-full p-0.5 transition-colors ${useNetlink ? 'bg-cyan-600' : 'bg-gray-700'}`}
+               >
+                 <span className={`block w-4 h-4 bg-white rounded-full shadow-md transform transition-transform ${useNetlink ? 'translate-x-4' : 'translate-x-0'}`}></span>
+               </button>
+           </div>
+           
+           {/* DEBUG TOGGLE */}
+           <button 
+             onClick={() => setShowDebug(!showDebug)}
+             className={`p-2 rounded-lg transition-all border ${showDebug ? 'bg-gray-800 text-green-400 border-green-800 shadow-lg' : 'bg-gray-900 text-gray-500 border-gray-800 hover:bg-gray-800'}`}
+           >
+             <Terminal size={14} />
+           </button>
+        </div>
+      </nav>
+
+      {/* --- MAIN CONTENT AREA --- */}
+      <main className="flex-1 flex flex-col items-center justify-end relative z-10 p-4">
         
-        for msg, version in messages:
-            msg_hash = hashlib.sha256(msg.encode()).hexdigest()
-            hashes.append(msg_hash)
-            version_vector[msg_hash] = version
-            
-        while len(hashes) > 1:
-            new_level = []
-            for i in range(0, len(hashes), 2):
-                combined = hashes[i] + (hashes[i+1] if i+1 < len(hashes) else "")
-                new_hash = hashlib.sha256(combined.encode()).hexdigest()
-                new_level.append(new_hash)
-                version_vector[new_hash] = max(
-                    version_vector[hashes[i]],
-                    version_vector[hashes[i+1]] if i+1 < len(hashes) else 0
-                )
-            hashes = new_level
-            
-        return hashes[0], version_vector
+        {/* Background Text */}
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <h1 className="text-8xl md:text-[12rem] lg:text-[18rem] font-black tracking-widest text-cyan-900/10 select-none">
+                MEDI<span className="text-red-900/10">VISION</span> PRO
+            </h1>
+        </div>
 
-# ======================
-# MAIN ENTRY POINT
-# ======================
+        {/* Image Upload Status */}
+        <div className="absolute top-4 right-4 z-50 flex items-start gap-4">
+            <label htmlFor="image-upload" className={`cursor-pointer px-4 py-2 rounded-lg border transition-all flex items-center gap-2 text-xs font-bold uppercase tracking-wider shadow-lg ${userFile ? 'bg-cyan-800 text-white border-cyan-500 shadow-cyan-500/30' : 'bg-gray-800/80 text-cyan-400 border-cyan-900 hover:bg-cyan-900/30'}`}>
+                <Upload size={14} />
+                {userFile ? 'SCAN LOADED' : 'UPLOAD SCAN'}
+                <input id="image-upload" type="file" accept="image/*" ref={fileInputRef} onChange={handleFileChange} className="hidden" disabled={thinking}/>
+            </label>
 
-async def main():
-    try:
-        messenger = HALOSMessenger()
-        if not await messenger.login():
-            logger.error("Failed to log in")
-            return
-            
-        # Example usage
-        await messenger.send_message("!room_id:matrix.org", "Hello HALOS!")
-        await messenger.send_media("!room_id:matrix.org", "photo.jpg")
-        
-        # Keep running
-        while True:
-            await asyncio.sleep(1)
-            
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+            {userFile && (
+                <div className="bg-gray-800 p-1 rounded-lg border border-cyan-500/50 shadow-xl relative">
+                    <img src={`data:${userFile.mimeType};base64,${userFile.base64}`} alt="Scan" className="w-20 h-20 object-cover opacity-90 rounded-md" />
+                    <button onClick={clearFile} className="absolute -top-2 -right-2 bg-red-700 text-white rounded-full p-1 border border-red-500 hover:bg-red-600 transition-transform hover:scale-110">
+                        <X size={10} />
+                    </button>
+                </div>
+            )}
+        </div>
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        {/* --- CHAT INTERFACE --- */}
+        <div className="w-full max-w-3xl px-4 z-20 mb-8">
+           <div className={`bg-gray-900/95 backdrop-blur-md rounded-xl shadow-2xl transition-all duration-300 flex flex-col gap-2 ${thinking ? 'border-2 border-cyan-400 shadow-cyan-500/40' : 'border border-gray-700/50 shadow-black'}`}>
+              
+              {/* STATUS BAR */}
+              <div className="flex justify-between items-center text-[10px] font-bold tracking-[0.1em] uppercase p-3 border-b border-gray-700/30">
+                 {/* Status Indicators */}
+                 <div className="flex items-center gap-4">
+                    <div className={`flex items-center gap-1 ${active ? 'text-red-500' : 'text-gray-600'}`}>
+                        <Cpu size={10} className={active ? 'animate-pulse' : ''} />
+                        CORE: {active ? 'OPERATIONAL' : 'INACTIVE'}
+                    </div>
+                    <div className={`flex items-center gap-1 ${listening ? 'text-cyan-400' : 'text-gray-600'}`}>
+                        <Mic size={10} className={listening ? 'animate-pulse' : ''} />
+                        VOICE INPUT
+                    </div>
+                    <div className={`flex items-center gap-1 ${speaking ? 'text-cyan-400' : 'text-gray-600'}`}>
+                        <Volume2 size={10} className={speaking ? 'animate-pulse' : ''} />
+                        VOICE OUTPUT
+                    </div>
+                 </div>
+                 
+                 {/* Thinking Indicator */}
+                 <div className="flex items-center gap-1">
+                    {thinking && <span className="text-cyan-400 animate-pulse flex items-center gap-1"><Sparkles size={10} /> ANALYZING DATA...</span>}
+                 </div>
+              </div>
+
+              {/* CONVERSATION HISTORY */}
+              <div className="h-56 overflow-y-auto px-4 py-3 space-y-3 scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent">
+                 {conversation.map((msg, idx) => (
+                    <div key={idx} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div className={`max-w-[85%] rounded-xl p-3 text-sm border shadow-md ${
+                            msg.sender === 'user' 
+                            ? 'bg-gray-700/30 border-gray-600 text-gray-100 rounded-br-sm' 
+                            : msg.sender === 'system'
+                            ? 'bg-gray-800/50 border-gray-700 text-gray-400 italic text-xs rounded-tl-sm'
+                            : 'bg-cyan-900/30 border-cyan-800/50 text-cyan-200 rounded-tl-sm'
+                        }`}>
+                           {msg.sender !== 'system' && <div className="text-[10px] uppercase opacity-50 mb-1 font-semibold">{msg.sender === 'user' ? 'OPERATOR' : 'MV CORE'}</div>}
+                           {msg.text}
+                        </div>
+                    </div>
+                 ))}
+                 <div ref={chatEndRef} />
+              </div>
+
+              {/* INPUT AREA */}
+              <div className="p-4 pt-0">
+                 {/* Text Input Form */}
+                 <form onSubmit={handleTextSubmit} className="flex gap-2 mb-3">
+                    <input 
+                       type="text" 
+                       value={inputText}
+                       onChange={(e) => setInputText(e.target.value)}
+                       placeholder={active ? "Enter query or diagnostic command..." : "System is inactive"}
+                       disabled={!active || thinking}
+                       className="flex-1 bg-gray-950 border border-gray-800 text-white text-sm px-4 py-3 rounded-full focus:outline-none focus:border-cyan-500 disabled:opacity-50 transition-shadow shadow-inner shadow-black/40"
+                    />
+                    <button 
+                       type="submit" 
+                       disabled={!active || thinking || !inputText.trim()}
+                       className="bg-cyan-700 text-white px-4 py-3 rounded-full hover:bg-cyan-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-lg shadow-cyan-900/30"
+                    >
+                       <Send size={16} />
+                    </button>
+                 </form>
+
+                 {/* Main Controls */}
+                 <div className="flex justify-center gap-2">
+                     <button 
+                        onClick={handleMainButtonClick}
+                        className={`flex-1 py-3 rounded-full font-bold tracking-widest transition-all active:scale-[0.99] flex justify-center items-center gap-2 border-2 shadow-lg ${
+                           active 
+                           ? 'bg-red-900/30 text-red-400 border-red-700 hover:bg-red-800/40 shadow-red-500/20' 
+                           : 'bg-gray-700/30 text-white border-gray-600 hover:bg-gray-700/50 shadow-gray-500/20'
+                        }`}
+                     >
+                        {active ? "TERMINATE SESSION" : "INITIATE SESSION"}
+                     </button>
+                     
+                     {active && (
+                       <button 
+                         onClick={startListening}
+                         disabled={listening || speaking || thinking}
+                         className={`px-6 py-3 rounded-full border font-bold transition-colors active:scale-[0.99] shadow-lg ${
+                            listening 
+                            ? 'bg-red-500/30 border-red-500 text-red-200 shadow-red-500/30 animate-pulse' 
+                            : 'bg-gray-800/50 border-gray-700 text-cyan-400 hover:bg-gray-700/50 shadow-cyan-500/20'
+                         }`}
+                       >
+                         <Mic size={20} />
+                       </button>
+                     )}
+                 </div>
+              </div>
+           </div>
+        </div>
+      </main>
+
+      {/* --- TERMINAL LOG --- */}
+      {showDebug && (
+        <div className="absolute top-20 right-4 w-60 h-48 bg-black/90 text-green-500 text-[10px] font-mono p-3 rounded-lg border border-green-900/50 z-50 overflow-y-auto shadow-xl">
+           <div className="border-b border-green-900/50 pb-1 mb-1 font-bold text-green-400 tracking-widest text-[11px] flex justify-between items-center">
+             SYS.LOG
+             <Terminal size={12} />
+           </div>
+           {logs.map((log, i) => (
+             <div key={i} className="mb-0.5 break-words opacity-80 leading-tight">
+               <span className="text-gray-500">[{log.time}]</span> <span className="text-cyan-600/70">{log.source}:</span> {log.message}
+             </div>
+           ))}
+        </div>
+      )}
+    </div>
+  );
+}
